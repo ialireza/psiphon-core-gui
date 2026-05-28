@@ -1,101 +1,108 @@
 #!/usr/bin/env python3
-import subprocess
 import sys
 import os
-import signal
-import time
+import subprocess
+import threading
+
+# 📌 پیدا کردن مسیر دقیق دایرکتوری جاری برنامه
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 📌 تشخیص خودکار مسیر باینری هسته سایفون بر اساس سیستم‌عامل
+if sys.platform.startswith('win'):
+    # اگر کاربر ویندوز بود، دنبال فایل اجرایی باینری ویندوز می‌گردد
+    CORE_BINARY = os.path.join(BASE_DIR, "psiphon-tunnel-core-i686.exe")
+else:
+    # اگر لینوکس یا سیستم‌عامل دیگری بود، از نسخه لینوکسی استفاده می‌کند
+    CORE_BINARY = os.path.join(BASE_DIR, "psiphon-tunnel-core-x86_64")
+
 
 class PsiphonTunnel:
-    def __init__(self, binary_path="./psiphon-tunnel-core-x86_64", config_path="./psiphon_temp.config"):
-        self.binary_path = binary_path
-        self.config_path = config_path
+    """کلاس مدیریت و کنترل فرآیندها و اجرای کلاینت هسته سایفون"""
+
+    def __init__(self, config_path="./psiphon_temp.config", data_dir="./psiphon_data"):
+        self.config_path = os.path.abspath(config_path)
+        self.data_dir = os.path.abspath(data_dir)
         self.process = None
         self.running = False
+        self._read_thread = None
 
     def start(self):
-        """باینری سایفون را با کانفیگ مشخص شده اجرا می‌کند"""
+        """راه‌اندازی و اجرای امن فرآیند کلاینت هسته"""
         if self.running:
-            print("تونل از قبل در حال اجراست.")
-            return False
+            return True
 
-        # بررسی وجود فایل‌ها
-        if not os.path.exists(self.binary_path):
-            print(f"خطا: فایل باینری در مسیر {self.binary_path} پیدا نشد.")
-            return False
-        if not os.path.exists(self.config_path):
-            print(f"خطا: فایل کانفیگ در مسیر {self.config_path} پیدا نشد.")
-            return False
-        if not os.access(self.binary_path, os.X_OK):
-            print(f"خطا: فایل باینری قابل اجرا نیست. دستور chmod +x {self.binary_path} را بزنید.")
-            return False
+        # بررسی وجود فایل باینری هسته قبل از اجرا
+        if not os.path.exists(CORE_BINARY):
+            raise FileNotFoundError(f"باینری هسته سایفون در مسیر مشخص شده یافت نشد:\n{CORE_BINARY}")
+
+        # در لینوکس، مطمئن می‌شویم فایل باینری اجازه اجرا (Execution Permission) دارد
+        if not sys.platform.startswith('win'):
+            try:
+                os.chmod(CORE_BINARY, 0o755)
+            except Exception as e:
+                print(f"⚠️ خطای دسترسی تمیز به باینری: {e}")
+
+        # آماده‌سازی آرگومان‌های خط فرمان برای اجرای هسته سایفون
+        cmd = [
+            CORE_BINARY,
+            "-config", self.config_path,
+            "-dataDir", self.data_dir
+        ]
 
         try:
-            # ایجاد پوشه دیتای سایفون در صورت عدم وجود جهت کش کردن سرورها
-            os.makedirs("./psiphon_data", exist_ok=True)
+            # ایجاد پروسس جدید و هدایت استاندارد خروجی‌ها (stdout/stderr)
+            # استفاده از creationflags در ویندوز برای جلوگیری از باز شدن پاپ‌آپ‌های CMD مزاحم
+            creation_flags = 0
+            if sys.platform.startswith('win'):
+                creation_flags = subprocess.CREATE_NO_WINDOW
 
-            # اجرای باینری با سوئیچ‌های استاندارد تایید شده در ترمینال
             self.process = subprocess.Popen(
-                [self.binary_path, "-config", self.config_path, "-formatNotices", "-dataRootDirectory", "./psiphon_data"],
+                cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # ادغام استریم خطا با خروجی اصلی
+                stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                preexec_fn=os.setsid if sys.platform != 'win32' else None
+                encoding='utf-8',
+                errors='ignore',
+                creationflags=creation_flags
             )
             self.running = True
             return True
         except Exception as e:
-            print(f"خطا در اجرای فرآیند سایفون: {e}")
             self.running = False
-            return False
+            raise RuntimeError(f"خطا در زمان استارت پروسس باینری سایفون: {e}")
+
+    def read_output(self, callback_func):
+        """خواندن لاگ‌های خروجی باینری به صورت زنده بدون فریز کردن برنامه"""
+        def reader():
+            while self.running and self.process:
+                line = self.process.stdout.readline()
+                if not line:
+                    break
+                # فرستادن لاگ خام دریافتی به متد بک‌تراک رابط گرافیکی
+                callback_func(line)
+
+            # وقتی حلقه تمام شود یعنی پروسس متوقف شده است
+            self.running = False
+
+        self._read_thread = threading.Thread(target=reader, daemon=True)
+        self._read_thread.start()
 
     def stop(self):
-        """فرآیند سایفون را به صورت امن متوقف می‌کند"""
-        if not self.running or self.process is None:
-            print("فرآیندی برای توقف وجود ندارد.")
-            return False
-
-        try:
-            print("در حال توقف فرآیند سایفون...")
-            if sys.platform == 'win32':
-                self.process.terminate()
-            else:
-                # ارسال سیگنال سیستمی به کل گروه فرآیند
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-
+        """توقف امن و کامل پروسس باینری سایفون و آزادسازی پورت‌ها"""
+        self.running = False
+        if self.process:
             try:
+                # تلاش برای بستن پروسس به صورت استاندارد
+                self.process.terminate()
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                print("فرآیند با TERM بسته نشد، از KILL استفاده می‌کنم.")
-                if sys.platform == 'win32':
+                # اگر پروسس در زمان معین بسته نشد، آن را فُورس کیل (Kill) می‌کنیم
+                try:
                     self.process.kill()
-                else:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                self.process.wait()
-
-            self.running = False
-            print("فرآیند متوقف شد.")
-            return True
-        except Exception as e:
-            print(f"خطا در توقف فرآیند: {e}")
-            return False
-
-    def read_output(self, callback=None):
-        """خروجی فرآیند را خط به خط می‌خواند و با callback پردازش می‌کند"""
-        if not self.running or self.process is None or self.process.stdout is None:
-            print("فرآیند در حال اجرا نیست یا خروجی ندارد.")
-            return
-
-        try:
-            for line in self.process.stdout:
-                line = line.strip()
-                if line:
-                    if callback:
-                        callback(line)
-                    else:
-                        print(f"[سایفون] {line}")
-        except Exception as e:
-            print(f"خطا در خواندن خروجی: {e}")
-        finally:
-            self.running = False
-            print("فرآیند سایفون به پایان رسید.")
+                except:
+                    pass
+            except:
+                pass
+            finally:
+                self.process = None
